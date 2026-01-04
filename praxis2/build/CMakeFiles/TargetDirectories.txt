@@ -1,0 +1,5 @@
+/Users/konstantin/Documents/Programming/c/Rechnernetze/Praxis 2/praxis2/build/CMakeFiles/webserver.dir
+/Users/konstantin/Documents/Programming/c/Rechnernetze/Praxis 2/praxis2/build/CMakeFiles/package.dir
+/Users/konstantin/Documents/Programming/c/Rechnernetze/Praxis 2/praxis2/build/CMakeFiles/package_source.dir
+/Users/konstantin/Documents/Programming/c/Rechnernetze/Praxis 2/praxis2/build/CMakeFiles/edit_cache.dir
+/Users/konstantin/Documents/Programming/c/Rechnernetze/Praxis 2/praxis2/build/CMakeFiles/rebuild_cache.dir
