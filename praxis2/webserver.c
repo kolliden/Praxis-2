@@ -18,6 +18,14 @@
 
 #define MAX_RESOURCES 100
 
+typedef struct __attribute__((__packed__)) lookup_message {
+        uint8_t msg_type;   // 0 = Lookup
+        uint16_t hash_id;
+        uint16_t node_id;
+        uint32_t ip;
+        uint16_t port;
+} lookup_message_t;
+
 struct tuple resources[MAX_RESOURCES] = {
     {"/static/foo", "Foo", sizeof "Foo" - 1},
     {"/static/bar", "Bar", sizeof "Bar" - 1},
@@ -25,7 +33,10 @@ struct tuple resources[MAX_RESOURCES] = {
 
 
 /* --- Node / neighborhood configuration (populated at startup) --- */
+
 static uint16_t NODE_ID = 0;
+static uint32_t NODE_IP = 0;
+static uint16_t NODE_PORT = 0;
 static uint16_t PRED_ID = 0;
 static uint16_t SUCC_ID = 0;
 static char PRED_IP[INET_ADDRSTRLEN] = {0};
@@ -33,15 +44,70 @@ static char PRED_PORT[6] = {0};
 static char SUCC_IP[INET_ADDRSTRLEN] = {0};
 static char SUCC_PORT[6] = {0};
 
-static int is_responsible(uint16_t key, uint16_t NODE_ID,
-                          uint16_t PRED_ID) {
-    if (NODE_ID == PRED_ID) {
-        return 1; // only node in the network
-    } else if (NODE_ID > PRED_ID) {
-        return key > PRED_ID && key <= NODE_ID;
-    } else {
-        return key > PRED_ID || key <= NODE_ID;
+/**
+ * Derives a sockaddr_in structure from the provided host and port information.
+ *
+ * @param host The host (IP address or hostname) to be resolved into a network
+ * address.
+ * @param port The port number to be converted into network byte order.
+ *
+ * @return A sockaddr_in structure representing the network address derived from
+ * the host and port.
+ */
+static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+    };
+    struct addrinfo *result_info;
+
+    // Resolve the host (IP address or hostname) into a list of possible
+    // addresses.
+    int returncode = getaddrinfo(host, port, &hints, &result_info);
+    if (returncode) {
+        fprintf(stderr, "Error parsing host/port");
+        exit(EXIT_FAILURE);
     }
+
+    // Copy the sockaddr_in structure from the first address in the list
+    struct sockaddr_in result = *((struct sockaddr_in *)result_info->ai_addr);
+
+    // Free the allocated memory for the result_info
+    freeaddrinfo(result_info);
+    return result;
+}
+
+
+static bool is_responsible(uint16_t key, uint16_t node_id, uint16_t pred_id) {
+    if (pred_id == node_id) return true; /* single-node circle */
+    if (pred_id < node_id) return (key > pred_id && key <= node_id);
+    return (key > pred_id || key <= node_id); /* wrap-around */
+}
+
+static bool knows_responsible_node(uint16_t key) {
+    return is_responsible(key, NODE_ID, PRED_ID) || (NODE_ID == SUCC_ID) || (PRED_ID == SUCC_ID);
+}
+
+void send_lookup(uint16_t key){
+    lookup_message_t msg = {
+        .msg_type = 0,
+        .hash_id = htons(key),
+        .node_id = htons(NODE_ID),
+        .ip = htonl(NODE_IP),
+        .port = htons(NODE_PORT),
+    };
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == -1) {
+        perror("socket");
+        return;
+    }
+    struct sockaddr_in succ_addr = derive_sockaddr(SUCC_IP, SUCC_PORT);
+    ssize_t send_bytes = sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&succ_addr, sizeof(succ_addr));
+    if (send_bytes == -1) {
+        perror("sendto");
+        return;
+    }
+    close(sock);
 }
 
 /**
@@ -62,8 +128,9 @@ void send_reply(int conn, struct request *request) {
             request->method, request->uri, request->payload_length);
 
     uint16_t key = pseudo_hash(request->uri, strlen(request->uri));
-    // if node not responsible for key, forward request to successor
-    if (!is_responsible(key, NODE_ID, PRED_ID)) {
+    fprintf(stderr, "Computed key (pseudo-hash) = %u (0x%04x)\n", (unsigned)key, (unsigned)key);
+
+    if (!is_responsible(key, NODE_ID, PRED_ID) && knows_responsible_node(key)) {
         /* Build Location: http://SUCC_IP:SUCC_PORT<uri> */
         int n = snprintf(buffer, sizeof(buffer),
                          "HTTP/1.1 303 See Other\r\n"
@@ -81,56 +148,71 @@ void send_reply(int conn, struct request *request) {
             offset = (size_t)n;
         }
 
+        // Send the reply back to the client
         if (send(conn, reply, offset, 0) == -1) {
             perror("send");
             close(conn);
         }
-        return;
-    }
-    // if node responsible for key, process request
-    if (strcmp(request->method, "GET") == 0) {
-        // Find the resource with the given URI in the 'resources' array.
-        size_t resource_length;
-        const char *resource =
-            get(request->uri, resources, MAX_RESOURCES, &resource_length);
 
-        if (resource) {
-            size_t payload_offset =
-                sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n",
-                        resource_length);
-            memcpy(reply + payload_offset, resource, resource_length);
-            offset = payload_offset + resource_length;
+    } else if ( !knows_responsible_node(key) ) {
+        fprintf(stderr, "Unknown responsible node for key %u, sending lookup\n", (unsigned)key);
+        send_lookup(key);
+
+        /* Inform client to retry later */
+        reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+        offset = strlen(reply);
+
+        // Send the reply back to the client
+        if (send(conn, reply, offset, 0) == -1) {
+            perror("send");
+            close(conn);
+        }
+    } else {
+        // if node responsible for key, process request
+        if (strcmp(request->method, "GET") == 0) {
+            // Find the resource with the given URI in the 'resources' array.
+            size_t resource_length;
+            const char *resource =
+                get(request->uri, resources, MAX_RESOURCES, &resource_length);
+
+            if (resource) {
+                size_t payload_offset =
+                    sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n",
+                            resource_length);
+                memcpy(reply + payload_offset, resource, resource_length);
+                offset = payload_offset + resource_length;
+            } else {
+                reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                offset = strlen(reply);
+            }
+        } else if (strcmp(request->method, "PUT") == 0) {
+            // Try to set the requested resource with the given payload in the
+            // 'resources' array.
+            if (set(request->uri, request->payload, request->payload_length,
+                    resources, MAX_RESOURCES)) {
+                reply = "HTTP/1.1 204 No Content\r\n\r\n";
+            } else {
+                reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+            }
+            offset = strlen(reply);
+        } else if (strcmp(request->method, "DELETE") == 0) {
+            // Try to delete the requested resource from the 'resources' array
+            if (delete (request->uri, resources, MAX_RESOURCES)) {
+                reply = "HTTP/1.1 204 No Content\r\n\r\n";
+            } else {
+                reply = "HTTP/1.1 404 Not Found\r\n\r\n";
+            }
+            offset = strlen(reply);
         } else {
-            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            reply = "HTTP/1.1 501 Method Not Supported\r\n\r\n";
             offset = strlen(reply);
         }
-    } else if (strcmp(request->method, "PUT") == 0) {
-        // Try to set the requested resource with the given payload in the
-        // 'resources' array.
-        if (set(request->uri, request->payload, request->payload_length,
-                resources, MAX_RESOURCES)) {
-            reply = "HTTP/1.1 204 No Content\r\n\r\n";
-        } else {
-            reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
-        }
-        offset = strlen(reply);
-    } else if (strcmp(request->method, "DELETE") == 0) {
-        // Try to delete the requested resource from the 'resources' array
-        if (delete (request->uri, resources, MAX_RESOURCES)) {
-            reply = "HTTP/1.1 204 No Content\r\n\r\n";
-        } else {
-            reply = "HTTP/1.1 404 Not Found\r\n\r\n";
-        }
-        offset = strlen(reply);
-    } else {
-        reply = "HTTP/1.1 501 Method Not Supported\r\n\r\n";
-        offset = strlen(reply);
-    }
 
-    // Send the reply back to the client
-    if (send(conn, reply, offset, 0) == -1) {
-        perror("send");
-        close(conn);
+        // Send the reply back to the client
+        if (send(conn, reply, offset, 0) == -1) {
+            perror("send");
+            close(conn);
+        }
     }
 }
 
@@ -253,38 +335,6 @@ bool handle_connection(struct connection_state *state) {
     state->end = buffer_discard(state->buffer, window_start - state->buffer,
                                 window_end - window_start);
     return true;
-}
-
-/**
- * Derives a sockaddr_in structure from the provided host and port information.
- *
- * @param host The host (IP address or hostname) to be resolved into a network
- * address.
- * @param port The port number to be converted into network byte order.
- *
- * @return A sockaddr_in structure representing the network address derived from
- * the host and port.
- */
-static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-    };
-    struct addrinfo *result_info;
-
-    // Resolve the host (IP address or hostname) into a list of possible
-    // addresses.
-    int returncode = getaddrinfo(host, port, &hints, &result_info);
-    if (returncode) {
-        fprintf(stderr, "Error parsing host/port");
-        exit(EXIT_FAILURE);
-    }
-
-    // Copy the sockaddr_in structure from the first address in the list
-    struct sockaddr_in result = *((struct sockaddr_in *)result_info->ai_addr);
-
-    // Free the allocated memory for the result_info
-    freeaddrinfo(result_info);
-    return result;
 }
 
 /**
@@ -426,6 +476,9 @@ int main(int argc, char **argv) {
     }
 
     struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
+
+    NODE_IP = ntohl(addr.sin_addr.s_addr);
+    NODE_PORT = ntohs(addr.sin_port);
 
     int server_socket_TCP = setup_server_socket(addr, SOCK_STREAM);
     int server_socket_UDP = setup_server_socket(addr, SOCK_DGRAM);
