@@ -661,38 +661,54 @@ int main(int argc, char **argv)
                         (unsigned)msg->msg_type, (unsigned)ntohs(msg->hash_id),
                         (unsigned)ntohs(msg->node_id), (unsigned)ntohl(msg->ip), (unsigned)ntohs(msg->port));
 
-                //Aufgabe 1.4 lookup reply
+                //Aufgabe 1.4 lookup reply und Aufgabe 1.5
                 if (msg->msg_type == 0)
                 {
                     uint16_t key = ntohs(msg->hash_id);
-                    uint16_t reply_node_id = NODE_ID;
-                    uint32_t reply_ip = NODE_IP;
-                    uint16_t reply_port = NODE_PORT;
-
-                    // If successor is responsible for this key, reply with successor's info
-                    if (is_responsible(key, SUCC_ID, NODE_ID))
+                    /*Im ersten Fall wird überprüft ob die Node selber oder  ihr Nachfolger verantworlich ist
+                    Falls ja schicke direkt die Reply, falls nicht schicke lookup an Nachfolger (Fall 2)*/
+                    if (is_responsible(key,NODE_ID,PRED_ID) || is_responsible(key,SUCC_ID,NODE_ID))
                     {
-                        // Convert SUCC_IP string to numeric for the reply
-                        struct in_addr addr;
-                        inet_pton(AF_INET, SUCC_IP, &addr);
-                        reply_node_id = SUCC_ID;
-                        reply_ip = ntohl(addr.s_addr);
-                        reply_port = (uint16_t)atoi(SUCC_PORT);
-                    }
+                        uint16_t reply_node_id = NODE_ID;
+                        uint32_t reply_ip = NODE_IP;        //IP ist 4byte groß
+                        uint16_t reply_port = NODE_PORT;
 
-                    lookup_message_t reply_msg = {
-                        .msg_type = 1,
-                        .hash_id = htons(NODE_ID),
-                        .node_id = htons(reply_node_id),
-                        .ip = htonl(reply_ip),
-                        .port = htons(reply_port),
-                    };
-                    // Convert sender's IP and port to strings for reply
-                    char ip_str[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &msg->ip, ip_str, sizeof(ip_str));
-                    char port_str[6];
-                    snprintf(port_str, sizeof(port_str), "%u", ntohs(msg->port));
-                    send_udp_message(&reply_msg, ip_str, port_str);
+                        // If successor is responsible for this key, reply with successor's info
+
+                        if (is_responsible(key,SUCC_ID,NODE_ID) &&(NODE_ID != SUCC_ID))   //Wenn der Nachfolger verantwortlich ist antworten mit dessen Werten
+                        {
+                            // Convert SUCC_IP string to numeric for the reply
+                            struct in_addr addr;
+                            inet_pton(AF_INET, SUCC_IP, &addr);
+                            reply_node_id = SUCC_ID;
+                            reply_ip = ntohl(addr.s_addr);
+                            reply_port = (uint16_t)atoi(SUCC_PORT);
+                        }
+                        else {  //Sonst sind wir verantworlich
+                            reply_node_id = htons(NODE_ID);
+                            reply_ip = htons(NODE_IP);
+                            reply_port = htons(NODE_PORT);
+                        }
+                        //Reply_msg vorbereiten
+                        lookup_message_t reply_msg = {
+                            .msg_type = 1,
+                            .hash_id = htons(NODE_ID), 
+                            .node_id = htons(reply_node_id),
+                            .ip = htonl(reply_ip),
+                            .port = htons(reply_port),
+                        };
+                        // Convert sender's IP and port to strings for reply
+                        char ip_str[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &msg->ip, ip_str, sizeof(ip_str));
+                        char port_str[6];
+                        snprintf(port_str, sizeof(port_str), "%u", ntohs(msg->port));
+                        send_udp_message(&reply_msg, ip_str, port_str);
+                    }
+                    //Fall 2 weder Node Selber noch Nachfolger ist verantwortlich -> Lookup an Nachfolger weiterleiten
+                    else{
+                        fprintf(stderr, "Forwarding lookup for key %u to successor %s:%s\n", key, SUCC_IP, SUCC_PORT);
+                        send_udp_message(msg,SUCC_IP,SUCC_PORT);
+                    }
                 }
             }
             else if (s == server_socket_TCP)
