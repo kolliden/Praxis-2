@@ -27,6 +27,18 @@ typedef struct __attribute__((__packed__)) lookup_message
     uint16_t port;
 } lookup_message_t;
 
+struct msg_data
+{
+    uint16_t hash_id;
+    uint16_t node_id;
+    uint32_t ip;
+    uint16_t port; 
+};
+
+struct msg_data lookup_cache[10];
+
+int cache_counter = 0;      //Zeigt auf das älteste Element im cache
+
 struct tuple resources[MAX_RESOURCES] = {
     {"/static/foo", "Foo", sizeof "Foo" - 1},
     {"/static/bar", "Bar", sizeof "Bar" - 1},
@@ -85,6 +97,18 @@ static bool is_responsible(uint16_t key, uint16_t node_id, uint16_t pred_id)
     if (pred_id < node_id)
         return (key > pred_id && key <= node_id);
     return (key > pred_id || key <= node_id); /* wrap-around */
+}
+/*Diese Funktion durchsucht das Array in dem die lookups gespeichert sind und liefert den lookup sofern er noch gecached ist */
+static struct msg_data* get_cached_info(uint16_t key)
+{
+    for (int i = 0; i < 10; ++i)
+    {
+        if (lookup_cache[i].port != 0 && is_responsible(key, lookup_cache[i].node_id, lookup_cache[i].hash_id))
+        {
+            return &lookup_cache[i];
+        }
+    }
+    return NULL;
 }
 
 static bool knows_responsible_node(uint16_t key)
@@ -162,9 +186,33 @@ static void send_lookup(uint16_t key, uint8_t type, const char *ip, const char *
  * @param request   A pointer to the struct containing the parsed request
  * information.
  */
+void send_redirect(int conn, const char* ip, const char* port,const char* uri)
+{
+    char buffer[1024];
+
+    int n = snprintf(buffer, sizeof(buffer),
+            "HTTP/1.1 303 See Other\r\n"
+            "Location: http://%s:%s%s\r\n"
+            "Content-Length:0\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            ip, port, uri);
+    if (n < 0 || (size_t)n >= sizeof(buffer))
+    {
+        const char *fallback = "HTTP/1.1 303 See Other\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
+        send(conn, fallback, strlen(fallback), 0);
+    }
+    else 
+    {
+        if (send(conn, buffer, (size_t)n, 0) == -1)
+        {
+            perror("send redirect");
+        }
+    }
+}
+
 void send_reply(int conn, struct request *request)
 {
-
     // Create a buffer to hold the HTTP reply
     char buffer[HTTP_MAX_SIZE];
     char *reply = buffer;
@@ -175,55 +223,10 @@ void send_reply(int conn, struct request *request)
 
     uint16_t key = pseudo_hash((const unsigned char *)request->uri, strlen(request->uri)); // Aufgabe 1.2 Hashing
     fprintf(stderr, "Computed key (pseudo-hash) = %u (0x%04x)\n", (unsigned)key, (unsigned)key);
+    struct msg_data* cached = get_cached_info(key);
 
-    if (!is_responsible(key, NODE_ID, PRED_ID) && knows_responsible_node(key))
+    if (is_responsible(key,NODE_ID,PRED_ID))
     {
-        /* Build Location: http://SUCC_IP:SUCC_PORT<uri> */
-        int n = snprintf(buffer, sizeof(buffer),
-                         "HTTP/1.1 303 See Other\r\n"
-                         "Location: http://%s:%s%s\r\n"
-                         "Content-Length: 0\r\n"
-                         "\r\n",
-                         SUCC_IP[0] ? SUCC_IP : "127.0.0.1",
-                         SUCC_PORT[0] ? SUCC_PORT : "80", request->uri);
-        if (n < 0 || (size_t)n >= sizeof(buffer))
-        {
-            /* Fallback minimal redirect if snprintf fails/truncates */
-            reply = "HTTP/1.1 303 See Other\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
-            offset = strlen(reply);
-        }
-        else
-        {
-            reply = buffer;
-            offset = (size_t)n;
-        }
-
-        // Send the reply back to the client
-        if (send(conn, reply, offset, 0) == -1)
-        {
-            perror("send");
-            close(conn);
-        }
-    }
-    else if (!knows_responsible_node(key))
-    {
-        fprintf(stderr, "Unknown responsible node for key %u, sending lookup\n", (unsigned)key);
-        send_lookup(key, 0, SUCC_IP, SUCC_PORT);
-
-        /* Inform client to retry later */
-        reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
-        offset = strlen(reply);
-
-        // Send the reply back to the client
-        if (send(conn, reply, offset, 0) == -1)
-        {
-            perror("send");
-            close(conn);
-        }
-    }
-    else
-    {
-        // if node responsible for key, process request
         if (strcmp(request->method, "GET") == 0)
         {
             // Find the resource with the given URI in the 'resources' array.
@@ -286,7 +289,30 @@ void send_reply(int conn, struct request *request)
             close(conn);
         }
     }
-}
+    else if (is_responsible(key, SUCC_ID, NODE_ID))
+    {
+        send_redirect(conn, SUCC_IP, SUCC_PORT, request->uri);
+    }
+    else if (cached != NULL)
+    {
+        char target_ip[INET_ADDRSTRLEN];
+        struct in_addr addr = { .s_addr = htonl(cached->ip) };
+        inet_ntop(AF_INET, &addr, target_ip, sizeof(target_ip));
+
+        char target_port[6];
+        snprintf(target_port, sizeof(target_port), "%u", cached->port);
+        send_redirect(conn, target_ip, target_port, request->uri);
+    }
+
+    else 
+    {
+        fprintf(stderr, "Unknown responsible node for key %u, sending lookup\n", (unsigned)key);
+        send_lookup(key, 0, SUCC_IP, SUCC_PORT);
+
+        reply = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n";
+        send(conn, reply, strlen(reply), 0);
+    }
+} 
 
 /**
  * Processes an incoming packet from the client.
@@ -514,6 +540,8 @@ int main(int argc, char **argv)
         NODE_ID = 0;
     }
 
+    memset(lookup_cache, 0, sizeof(lookup_cache));    //Lookup array mit 0 initialisieren
+
     /* Read neighborhood from environment variables */
     const char *env;
 
@@ -629,13 +657,12 @@ int main(int argc, char **argv)
             exit(EXIT_FAILURE);
         }
 
+        
         // Process events on the monitored sockets.
         for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1)
         {
             if (sockets[i].revents != POLLIN)
             {
-                // If there are no POLLIN events on the socket, continue to the
-                // next iteration.
                 continue;
             }
             int s = sockets[i].fd;
@@ -643,92 +670,90 @@ int main(int argc, char **argv)
             if (s == server_socket_UDP)
             {
                 char buffer[HTTP_MAX_SIZE];
-
                 ssize_t bytes_received = recvfrom(server_socket_UDP, buffer, HTTP_MAX_SIZE, 0, NULL, NULL);
+                
                 if (bytes_received == -1)
                 {
                     perror("recvfrom");
                     close(server_socket_UDP);
                     exit(EXIT_FAILURE);
                 }
-                // if (bytes_received != sizeof(lookup_message_t))
-                // {
-                //     fprintf(stderr, "Received malformed UDP packet\n");
-                //     continue;
-                // }
+
                 lookup_message_t *msg = (lookup_message_t *)buffer;
-                fprintf(stderr, "Received UDP message type %u for hash id %u from node %u, ip: %u:%u\n",
-                        (unsigned)msg->msg_type, (unsigned)ntohs(msg->hash_id),
-                        (unsigned)ntohs(msg->node_id), (unsigned)ntohl(msg->ip), (unsigned)ntohs(msg->port));
+                uint16_t key = ntohs(msg->hash_id); 
 
-                //Aufgabe 1.4 lookup reply und Aufgabe 1.5
-                if (msg->msg_type == 0)
+                fprintf(stderr, "Received UDP message type %u for hash id %u\n", 
+                        (unsigned)msg->msg_type, (unsigned)key);
+
+                if (msg->msg_type == 0) // Lookup Request
                 {
-                    uint16_t key = ntohs(msg->hash_id);
-                    /*Im ersten Fall wird überprüft ob die Node selber oder  ihr Nachfolger verantworlich ist
-                    Falls ja schicke direkt die Reply, falls nicht schicke lookup an Nachfolger (Fall 2)*/
-                    if (is_responsible(key,NODE_ID,PRED_ID) || is_responsible(key,SUCC_ID,NODE_ID))
+                    uint16_t reply_node_id;
+                    uint16_t reply_range_start;
+                    uint32_t reply_ip;
+                    uint16_t reply_port;
+
+                    if (is_responsible(key, NODE_ID, PRED_ID))
                     {
-                        uint16_t reply_node_id = NODE_ID;
-                        uint32_t reply_ip = NODE_IP;        //IP ist 4byte groß
-                        uint16_t reply_port = NODE_PORT;
-
-                        // If successor is responsible for this key, reply with successor's info
-
-                        if (is_responsible(key,SUCC_ID,NODE_ID) &&(NODE_ID != SUCC_ID))   //Wenn der Nachfolger verantwortlich ist antworten mit dessen Werten
-                        {
-                            // Convert SUCC_IP string to numeric for the reply
-                            struct in_addr addr;
-                            inet_pton(AF_INET, SUCC_IP, &addr);
-                            reply_node_id = SUCC_ID;
-                            reply_ip = ntohl(addr.s_addr);
-                            reply_port = (uint16_t)atoi(SUCC_PORT);
-                        }
-                        else {  //Sonst sind wir verantworlich
-                            reply_node_id = htons(NODE_ID);
-                            reply_ip = htons(NODE_IP);
-                            reply_port = htons(NODE_PORT);
-                        }
-                        //Reply_msg vorbereiten
-                        lookup_message_t reply_msg = {
-                            .msg_type = 1,
-                            .hash_id = htons(NODE_ID), 
-                            .node_id = htons(reply_node_id),
-                            .ip = htonl(reply_ip),
-                            .port = htons(reply_port),
-                        };
-                        // Convert sender's IP and port to strings for reply
-                        char ip_str[INET_ADDRSTRLEN];
-                        inet_ntop(AF_INET, &msg->ip, ip_str, sizeof(ip_str));
-                        char port_str[6];
-                        snprintf(port_str, sizeof(port_str), "%u", ntohs(msg->port));
-                        send_udp_message(&reply_msg, ip_str, port_str);
+                        reply_node_id = NODE_ID;
+                        reply_range_start = PRED_ID;
+                        reply_ip = NODE_IP;
+                        reply_port = NODE_PORT;
                     }
-                    //Fall 2 weder Node Selber noch Nachfolger ist verantwortlich -> Lookup an Nachfolger weiterleiten
-                    else{
+                    else if (is_responsible(key, SUCC_ID, NODE_ID) && (NODE_ID != SUCC_ID))
+                    {
+                        struct in_addr addr;
+                        inet_pton(AF_INET, SUCC_IP, &addr);
+                        reply_node_id = SUCC_ID;
+                        reply_range_start = NODE_ID;
+                        reply_ip = ntohl(addr.s_addr);
+                        reply_port = (uint16_t)atoi(SUCC_PORT);
+                    }
+                    else 
+                    {
+                        // Weder ich noch mein Nachfolger sind zuständig -> Weiterleiten
                         fprintf(stderr, "Forwarding lookup for key %u to successor %s:%s\n", key, SUCC_IP, SUCC_PORT);
-                        send_udp_message(msg,SUCC_IP,SUCC_PORT);
+                        send_udp_message(msg, SUCC_IP, SUCC_PORT);
+                        continue; 
                     }
+
+                    lookup_message_t reply_msg = {
+                        .msg_type = 1,
+                        .hash_id = htons(reply_range_start), 
+                        .node_id = htons(reply_node_id),
+                        .ip = htonl(reply_ip),
+                        .port = htons(reply_port),
+                    };
+
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &msg->ip, ip_str, sizeof(ip_str));
+                    char port_str[6];
+                    snprintf(port_str, sizeof(port_str), "%u", ntohs(msg->port));
+                    send_udp_message(&reply_msg, ip_str, port_str);
                 }
-            }
+                else if (msg->msg_type == 1) // Lookup Reply (Caching)
+                {
+                    struct msg_data msg_p = {
+                        .hash_id = ntohs(msg->hash_id),
+                        .node_id = ntohs(msg->node_id),
+                        .ip = ntohl(msg->ip),
+                        .port = ntohs(msg->port),
+                    };
+                    lookup_cache[cache_counter] = msg_p;
+                    cache_counter = (cache_counter + 1) % 10;
+                    fprintf(stderr, "Cached info for node %u\n", msg_p.node_id);
+                }
+            } // Ende if (s == server_socket_UDP)
             else if (s == server_socket_TCP)
             {
-
-                // If the event is on the server_socket, accept a new connection
-                // from a client.
                 int connection = accept(server_socket_TCP, NULL, NULL);
-                if (connection == -1 && errno != EAGAIN &&
-                    errno != EWOULDBLOCK)
+                if (connection == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
                 {
-                    close(server_socket_TCP);
                     perror("accept");
                     exit(EXIT_FAILURE);
                 }
                 else
                 {
                     connection_setup(&state, connection);
-
-                    // limit to one connection at a time
                     sockets[0].events = 0;
                     sockets[1].fd = connection;
                     sockets[1].events = POLLIN;
@@ -737,18 +762,15 @@ int main(int argc, char **argv)
             else
             {
                 assert(s == state.sock);
-
-                // Call the 'handle_connection' function to process the incoming
-                // data on the socket.
                 bool cont = handle_connection(&state);
                 if (!cont)
-                { // get ready for a new connection
+                {
                     sockets[0].events = POLLIN;
                     sockets[1].fd = -1;
                     sockets[1].events = 0;
                 }
             }
         }
-    }
+    } 
     return EXIT_SUCCESS;
 }
